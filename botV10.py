@@ -640,8 +640,12 @@ async def on_member_join(member):
         except discord.Forbidden:
             pass
 
-        # Si le bot n'a pas été ajouté par le propriétaire → expulsion du bot + de l'inviteur
-        if inviter_id != owner_id:
+        # Whitelist : un membre peut être autorisé à ajouter des bots via +whitelist bot @membre
+        bot_wl = get_guild_cfg(guild.id).get("bot_whitelist", [])
+        is_whitelisted = inviter_id is not None and inviter_id in bot_wl
+
+        # Si le bot n'a pas été ajouté par le propriétaire ni par un membre whitelist → expulsion du bot + de l'inviteur
+        if inviter_id != owner_id and not is_whitelisted:
             # 1) Expulser le bot
             try:
                 await member.kick(reason="[Anti-Bot] Seul le propriétaire du serveur peut ajouter des bots.")
@@ -672,19 +676,22 @@ async def on_member_join(member):
             await send_log(guild, e)
             return  # on arrête ici, pas de rôle auto ni de welcome pour un bot expulsé
 
-        # ── Bot autorisé (ajouté par le propriétaire) : log Invite-Check "OAuth" ──
+        # ── Bot autorisé (propriétaire ou membre whitelist) : log Invite-Check "OAuth" ──
         await send_invite_check(guild, f"**{member}** joined using OAuth.")
 
     _bot_stats["members_joined_week"] += 1
     cfg = get_guild_cfg(member.guild.id)
-    auto_role_id = cfg.get("auto_role")
-    if auto_role_id:
-        role = member.guild.get_role(int(auto_role_id))
-        if role:
-            try:
-                await member.add_roles(role, reason="Auto-rôle à l'arrivée")
-            except discord.Forbidden:
-                pass
+    auto_role_ids = cfg.get("auto_roles")
+    if auto_role_ids is None:
+        # Compatibilité avec l'ancien système à rôle unique
+        legacy = cfg.get("auto_role")
+        auto_role_ids = [int(legacy)] if legacy else []
+    auto_roles = [r for rid in auto_role_ids if (r := member.guild.get_role(int(rid))) is not None]
+    if auto_roles:
+        try:
+            await member.add_roles(*auto_roles, reason="Auto-rôle(s) à l'arrivée")
+        except discord.Forbidden:
+            pass
 
     # ── Invite-Check : détecter quelle invitation a été utilisée (membres humains) ──
     if not member.bot:
@@ -1944,6 +1951,8 @@ HELP_SECTIONS = {
         "commands": [
             ("lock",        "[salon]",                   "Verrouiller un salon"),
             ("unlock",      "[salon]",                   "Déverrouiller un salon"),
+            ("lockall",     "",                           "Verrouiller TOUS les salons textuels"),
+            ("unlockall",   "",                           "Déverrouiller TOUS les salons textuels"),
             ("slowmode",    "<sec> [salon]",             "Définir le slowmode"),
             ("nuke",        "[salon]",                   "Recréer un salon (efface tout)"),
             ("createtext",  "<nom> [catégorie]",         "Créer un salon textuel"),
@@ -2021,7 +2030,9 @@ HELP_SECTIONS = {
             ("invites",             "[@membre]",                    "Voir les invitations d'un membre"),
             ("statistic",           "[@membre]",                    "Stats messages & temps vocal d'un membre"),
             ("leaderboard",         "",                             "Top 3 messages & Top 3 temps vocal + ton classement"),
-            ("autorole",            "<rôle>",                    "Auto-rôle à l'arrivée"),
+            ("autorole",            "<rôle> | add/remove/list",  "Auto-rôle(s) à l'arrivée (plusieurs possibles)"),
+            ("massrole",            "<add|remove> <rôle> [all|humans|bots]", "Ajouter/retirer un rôle à tout le serveur"),
+            ("whitelist bot",       "<@membre> | list",          "Autoriser un membre à ajouter des bots"),
             ("setwelcome",          "<salon> <message>",         "Message de bienvenue (variables : {mention} {name} {server} {number})"),
             ("setwelcometitle",     "<titre>",                   "Titre de l'embed de bienvenue"),
             ("setwelcomeimage",     "<url> (ou joins une image/gif)", "Image/gif affiché dans le message de bienvenue"),
@@ -2692,6 +2703,86 @@ async def unlock(ctx, channel: discord.TextChannel = None):
     await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
     e = success_embed("🔓 Salon déverrouillé", f"{channel.mention} est maintenant ouvert.\n**Modérateur :** {ctx.author.mention}")
     await ctx.send(embed=e)
+    await send_log(ctx.guild, e)
+
+@bot.command(name="lockall")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_channels=True)
+async def lockall(ctx):
+    """Verrouiller tous les salons textuels du serveur. Usage : +lockall"""
+    confirm_msg = await ctx.send(embed=warning_embed(
+        "🔒 Confirmation Lockall",
+        f"Verrouiller les **{len(ctx.guild.text_channels)}** salon(s) textuel(s) du serveur ?\nTape `CONFIRMER` dans les 15 secondes."
+    ))
+
+    def check(m): return m.author == ctx.author and m.channel == ctx.channel and m.content == "CONFIRMER"
+    try:
+        await bot.wait_for("message", check=check, timeout=15)
+    except asyncio.TimeoutError:
+        await confirm_msg.delete()
+        return await ctx.reply("❌ Lockall annulé.")
+
+    status_msg = await ctx.send(f"⏳ Verrouillage en cours... 0/{len(ctx.guild.text_channels)}")
+    locked, failed, done = 0, 0, 0
+    for channel in ctx.guild.text_channels:
+        done += 1
+        try:
+            overwrite = channel.overwrites_for(ctx.guild.default_role)
+            overwrite.send_messages = False
+            await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Lockall par {ctx.author}")
+            locked += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+        if done % 10 == 0:
+            try:
+                await status_msg.edit(content=f"⏳ Verrouillage en cours... {done}/{len(ctx.guild.text_channels)}")
+            except discord.HTTPException:
+                pass
+        await asyncio.sleep(0.3)  # évite le rate-limit Discord
+
+    cfg = get_guild_cfg(ctx.guild.id)
+    cfg["lockall_active"] = True
+    save_config()
+
+    e = mod_embed("🔒 Lockall", f"**{locked}** salon(s) verrouillé(s).\n**Échecs :** {failed}\n**Modérateur :** {ctx.author.mention}", discord.Color.orange())
+    try:
+        await status_msg.edit(content=None, embed=e)
+    except discord.HTTPException:
+        await ctx.send(embed=e)
+    await send_log(ctx.guild, e)
+
+@bot.command(name="unlockall")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_channels=True)
+async def unlockall(ctx):
+    """Déverrouiller tous les salons textuels du serveur. Usage : +unlockall"""
+    status_msg = await ctx.send(f"⏳ Déverrouillage en cours... 0/{len(ctx.guild.text_channels)}")
+    unlocked, failed, done = 0, 0, 0
+    for channel in ctx.guild.text_channels:
+        done += 1
+        try:
+            overwrite = channel.overwrites_for(ctx.guild.default_role)
+            overwrite.send_messages = None
+            await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Unlockall par {ctx.author}")
+            unlocked += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+        if done % 10 == 0:
+            try:
+                await status_msg.edit(content=f"⏳ Déverrouillage en cours... {done}/{len(ctx.guild.text_channels)}")
+            except discord.HTTPException:
+                pass
+        await asyncio.sleep(0.3)
+
+    cfg = get_guild_cfg(ctx.guild.id)
+    cfg["lockall_active"] = False
+    save_config()
+
+    e = success_embed("🔓 Unlockall", f"**{unlocked}** salon(s) déverrouillé(s).\n**Échecs :** {failed}\n**Modérateur :** {ctx.author.mention}")
+    try:
+        await status_msg.edit(content=None, embed=e)
+    except discord.HTTPException:
+        await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
 @bot.command()
@@ -5030,14 +5121,190 @@ async def removerole(ctx, member: discord.Member, role: discord.Role):
     await ctx.send(embed=e)
     await send_log(ctx.guild, e)
 
-@bot.command()
+@bot.command(name="massrole")
 @commands.has_permissions(administrator=True)
-async def autorole(ctx, role: discord.Role):
-    """Définir le rôle automatiquement donné aux nouveaux membres."""
+@commands.bot_has_permissions(manage_roles=True)
+async def massrole(ctx, action: str, role: discord.Role, cible: str = "all"):
+    """Ajouter/retirer un rôle à tous les membres du serveur.
+    Usage : +massrole <add|remove> <@rôle> [all|humans|bots]"""
+    action = action.lower()
+    cible  = cible.lower()
+
+    if action not in ("add", "remove"):
+        return await ctx.reply("❌ Usage : `+massrole <add|remove> <@rôle> [all|humans|bots]`")
+    if cible not in ("all", "humans", "bots"):
+        return await ctx.reply("❌ Cible invalide. Utilise `all`, `humans` ou `bots`.")
+    if role >= ctx.guild.me.top_role:
+        return await ctx.reply("❌ Je ne peux pas gérer un rôle égal ou supérieur à mon rôle le plus haut.")
+    if ctx.author != ctx.guild.owner and role >= ctx.author.top_role:
+        return await ctx.reply("❌ Tu ne peux pas gérer un rôle égal ou supérieur à ton rôle le plus haut.")
+
+    members = [
+        m for m in ctx.guild.members
+        if cible == "all" or (cible == "humans" and not m.bot) or (cible == "bots" and m.bot)
+    ]
+    verb = "Ajouter" if action == "add" else "Retirer"
+
+    confirm_msg = await ctx.send(embed=warning_embed(
+        "⚠️ Confirmation Massrole",
+        f"{verb} {role.mention} {'à' if action == 'add' else 'de'} **{len(members)}** membre(s) (`{cible}`) ?\n"
+        f"Tape `CONFIRMER` dans les 15 secondes."
+    ))
+
+    def check(m): return m.author == ctx.author and m.channel == ctx.channel and m.content == "CONFIRMER"
+    try:
+        await bot.wait_for("message", check=check, timeout=15)
+    except asyncio.TimeoutError:
+        await confirm_msg.delete()
+        return await ctx.reply("❌ Massrole annulé.")
+
+    status_msg = await ctx.send(f"⏳ {verb} le rôle en cours... 0/{len(members)}")
+    done, changed, failed = 0, 0, 0
+
+    for member in members:
+        done += 1
+        try:
+            if action == "add":
+                if role not in member.roles:
+                    await member.add_roles(role, reason=f"Massrole par {ctx.author}")
+                    changed += 1
+            else:
+                if role in member.roles:
+                    await member.remove_roles(role, reason=f"Massrole par {ctx.author}")
+                    changed += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+
+        if done % 25 == 0:
+            try:
+                await status_msg.edit(content=f"⏳ {verb} le rôle en cours... {done}/{len(members)}")
+            except discord.HTTPException:
+                pass
+        await asyncio.sleep(0.3)  # évite le rate-limit Discord
+
+    e = success_embed(
+        "✅ Massrole terminé",
+        f"**Rôle :** {role.mention}\n**Action :** {verb}\n**Cible :** `{cible}`\n"
+        f"**Modifiés :** {changed}\n**Déjà à jour / ignorés :** {done - changed - failed}\n**Échecs :** {failed}\n"
+        f"**Total traité :** {done}\n**Modérateur :** {ctx.author.mention}"
+    )
+    try:
+        await status_msg.edit(content=None, embed=e)
+    except discord.HTTPException:
+        await ctx.send(embed=e)
+    await send_log(ctx.guild, e)
+
+@bot.group(name="autorole", invoke_without_command=True)
+@commands.has_permissions(administrator=True)
+async def autorole(ctx, role: discord.Role = None):
+    """Auto-rôle(s) donnés automatiquement aux nouveaux membres (plusieurs rôles possibles).
+    Usage : +autorole <rôle> (raccourci = ajouter) | +autorole add/remove/list"""
+    if role is None:
+        return await ctx.send_help(ctx.command)
+    await _autorole_add(ctx, role)
+
+async def _autorole_add(ctx, role: discord.Role):
     cfg = get_guild_cfg(ctx.guild.id)
-    cfg["auto_role"] = role.id
+    roles = cfg.get("auto_roles")
+    if roles is None:
+        # Migration depuis l'ancien système à rôle unique
+        roles = []
+        legacy = cfg.get("auto_role")
+        if legacy:
+            roles.append(int(legacy))
+    if role.id in roles:
+        return await ctx.reply(f"❌ {role.mention} est déjà un auto-rôle.")
+    roles.append(role.id)
+    cfg["auto_roles"] = roles
+    cfg.pop("auto_role", None)
     save_config()
-    await ctx.reply(f"✅ Auto-rôle défini sur {role.mention}.")
+    await ctx.reply(f"✅ {role.mention} ajouté aux auto-rôles ({len(roles)} au total).")
+
+@autorole.command(name="add")
+@commands.has_permissions(administrator=True)
+async def autorole_add_cmd(ctx, role: discord.Role):
+    """Ajouter un rôle à la liste des auto-rôles. Usage : +autorole add <rôle>"""
+    await _autorole_add(ctx, role)
+
+@autorole.command(name="remove")
+@commands.has_permissions(administrator=True)
+async def autorole_remove_cmd(ctx, role: discord.Role):
+    """Retirer un rôle de la liste des auto-rôles. Usage : +autorole remove <rôle>"""
+    cfg = get_guild_cfg(ctx.guild.id)
+    roles = cfg.get("auto_roles")
+    if roles is None:
+        legacy = cfg.get("auto_role")
+        roles = [int(legacy)] if legacy else []
+    if role.id not in roles:
+        return await ctx.reply(f"❌ {role.mention} n'est pas un auto-rôle.")
+    roles.remove(role.id)
+    cfg["auto_roles"] = roles
+    cfg.pop("auto_role", None)
+    save_config()
+    await ctx.reply(f"✅ {role.mention} retiré des auto-rôles ({len(roles)} restant(s)).")
+
+@autorole.command(name="list")
+async def autorole_list_cmd(ctx):
+    """Lister les auto-rôles configurés. Usage : +autorole list"""
+    cfg = get_guild_cfg(ctx.guild.id)
+    roles = cfg.get("auto_roles")
+    if roles is None:
+        legacy = cfg.get("auto_role")
+        roles = [int(legacy)] if legacy else []
+    mentions = []
+    for rid in roles:
+        r = ctx.guild.get_role(int(rid))
+        if r:
+            mentions.append(r.mention)
+    if not mentions:
+        return await ctx.reply("Aucun auto-rôle configuré.")
+    await ctx.send(embed=info_embed("👤 Auto-rôles", "\n".join(mentions)))
+
+# ─────────────────────────────────────────
+#  WHITELIST
+# ─────────────────────────────────────────
+@bot.group(name="whitelist", invoke_without_command=True)
+@commands.has_permissions(administrator=True)
+async def whitelist_cmd(ctx):
+    """Gérer les whitelists du bot. Usage : +whitelist bot <@membre>"""
+    e = info_embed(
+        "📋 Whitelist",
+        "**`+whitelist bot <@membre>`** — Autorise/retire l'autorisation pour un membre "
+        "d'ajouter des bots sur le serveur sans être expulsé par l'anti-bot.\n"
+        "**`+whitelist bot list`** — Liste les membres whitelist."
+    )
+    await ctx.send(embed=e)
+
+@whitelist_cmd.group(name="bot", invoke_without_command=True)
+@commands.has_permissions(administrator=True)
+async def whitelist_bot_cmd(ctx, user: discord.User = None):
+    """Whitelister/dé-whitelister un membre pour l'ajout de bots. Usage : +whitelist bot <@membre>"""
+    if user is None:
+        return await ctx.send_help(ctx.command)
+    cfg = get_guild_cfg(ctx.guild.id)
+    wl = cfg.setdefault("bot_whitelist", [])
+    if user.id in wl:
+        wl.remove(user.id)
+        save_config()
+        e = mod_embed("🤖 Whitelist Bot", f"{user.mention} a été **retiré** de la whitelist bot.\n**Modérateur :** {ctx.author.mention}", discord.Color.orange())
+        await ctx.send(embed=e)
+        return await send_log(ctx.guild, e)
+    wl.append(user.id)
+    save_config()
+    e = success_embed("🤖 Whitelist Bot", f"{user.mention} peut maintenant **ajouter des bots** sans être expulsé par l'anti-bot.\n**Modérateur :** {ctx.author.mention}")
+    await ctx.send(embed=e)
+    await send_log(ctx.guild, e)
+
+@whitelist_bot_cmd.command(name="list")
+@commands.has_permissions(administrator=True)
+async def whitelist_bot_list_cmd(ctx):
+    """Lister les membres whitelist pour l'ajout de bots. Usage : +whitelist bot list"""
+    cfg = get_guild_cfg(ctx.guild.id)
+    wl = cfg.get("bot_whitelist", [])
+    if not wl:
+        return await ctx.reply("Aucun membre whitelist pour l'ajout de bots.")
+    lines = "\n".join(f"<@{uid}> (`{uid}`)" for uid in wl)
+    await ctx.send(embed=info_embed("🤖 Whitelist Bot", lines))
 
 @bot.command()
 @commands.has_permissions(administrator=True)
